@@ -56,6 +56,10 @@ def _sdk_download(rctx, urls, sha256, strip_prefix):
 
     rctx.download_and_extract(**kwargs)
 
+def _host_is_linux_x86_64(rctx):
+    """True when the repo rule host can execute the linux-x86_64 toolchain binaries."""
+    return rctx.os.name.lower().startswith("linux") and rctx.os.arch in ("amd64", "x86_64")
+
 def _compile_cc_file(rctx, src_name, out_name, toolchain_bindir = None, std = "c++11"):
     rctx.report_progress("Compiling {}".format(paths.basename(src_name)))
     if not toolchain_bindir:
@@ -89,6 +93,9 @@ def _compile_cc_file(rctx, src_name, out_name, toolchain_bindir = None, std = "c
 
 def _ensure_swift_compatibility_stub_archives(rctx, toolchain_bindir, toolchain_dir):
     """Create Swift compatibility stub archives expected by Apple linkers."""
+    if not _host_is_linux_x86_64(rctx):
+        # Requires executing the hermetic linux clang; skip on other hosts.
+        return
     clang = toolchain_bindir + "clang"
     llvm_ar = toolchain_bindir + "llvm-ar"
     if rctx.execute(["test", "-x", clang]).return_code != 0:
@@ -294,43 +301,44 @@ def _apple_cross_toolchain_impl(rctx):
     ])
     sdk_clang_ver = result.stdout.strip()
     if sdk_clang_ver:
+        # Detect the LLVM major version from the prebuilt's resource dir
+        # (lib/clang/<major>) instead of executing clang, which is not
+        # possible on non-linux hosts.
         result = rctx.execute([
-            xcode_toolchain_bindir + "clang",
-            "--version",
+            "bash",
+            "-c",
+            "ls -1 " + llvm_prebuilt_lib + "/clang/ 2>/dev/null | head -1",
         ])
+        detected = result.stdout.strip().split(".")[0]
 
-        # Extract major version from "clang version X.Y.Z"
-        for line in result.stdout.split("\n"):
-            if "clang version" in line:
-                llvm_ver = line.split("clang version")[1].strip().split(".")[0]
-                if llvm_ver != sdk_clang_ver:
-                    llvm_clang_dir = clang_lib_dir + llvm_ver
-                    sdk_clang_dir = clang_lib_dir + sdk_clang_ver
-                    result = rctx.execute(["test", "-d", llvm_clang_dir])
+        llvm_ver = detected
+        if llvm_ver and llvm_ver != sdk_clang_ver:
+            llvm_clang_dir = clang_lib_dir + llvm_ver
+            sdk_clang_dir = clang_lib_dir + sdk_clang_ver
+            result = rctx.execute(["test", "-d", llvm_clang_dir])
+            if result.return_code != 0:
+                # LLVM version dir doesn't exist at all — symlink it
+                # to the SDK version.
+                rctx.execute([
+                    "ln",
+                    "-sfn",
+                    sdk_clang_ver,
+                    llvm_clang_dir,
+                ])
+            else:
+                # LLVM version dir exists (from prebuilt) with headers
+                # but the SDK's compiler-rt builtins (lib/darwin/) are
+                # under the SDK version. Symlink missing subdirs.
+                result = rctx.execute(["test", "-d", sdk_clang_dir + "/lib"])
+                if result.return_code == 0:
+                    result = rctx.execute(["test", "-e", llvm_clang_dir + "/lib"])
                     if result.return_code != 0:
-                        # LLVM version dir doesn't exist at all — symlink it
-                        # to the SDK version.
                         rctx.execute([
                             "ln",
                             "-sfn",
-                            sdk_clang_ver,
-                            llvm_clang_dir,
+                            "../" + sdk_clang_ver + "/lib",
+                            llvm_clang_dir + "/lib",
                         ])
-                    else:
-                        # LLVM version dir exists (from prebuilt) with headers
-                        # but the SDK's compiler-rt builtins (lib/darwin/) are
-                        # under the SDK version. Symlink missing subdirs.
-                        result = rctx.execute(["test", "-d", sdk_clang_dir + "/lib"])
-                        if result.return_code == 0:
-                            result = rctx.execute(["test", "-e", llvm_clang_dir + "/lib"])
-                            if result.return_code != 0:
-                                rctx.execute([
-                                    "ln",
-                                    "-sfn",
-                                    "../" + sdk_clang_ver + "/lib",
-                                    llvm_clang_dir + "/lib",
-                                ])
-                break
 
     # Populate cxx_builtin_include_directories with the absolute repo path so
     # that Bazel's include scanner matches resolved absolute include paths from
@@ -369,16 +377,18 @@ def _apple_cross_toolchain_impl(rctx):
     # Detect Xcode version and SDK version for environment variables.
     _xcode_version_plist = "Xcode.app/Contents/version.plist"
     result = rctx.execute([
-        "bash",
+        "python3",
         "-c",
-        xcode_toolchain_bindir + "PlistBuddy -c 'Print CFBundleShortVersionString' " + _xcode_version_plist + " 2>/dev/null || echo '16.0'",
+        "import plistlib,sys; print(plistlib.load(open(sys.argv[1],'rb'))['CFBundleShortVersionString'])",
+        _xcode_version_plist,
     ])
-    substitutions["%{xcode_version}"] = result.stdout.strip() if result.return_code == 0 else "16.0"
+    substitutions["%{xcode_version}"] = result.stdout.strip() if result.return_code == 0 and result.stdout.strip() else "16.0"
 
     # Detect SDK version from SDKSettings.json (more reliable than directory name).
     _sdk_settings = _developer_dir_path + "/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/SDKSettings.json"
     result = rctx.execute([
-        "python3", "-c",
+        "python3",
+        "-c",
         "import json,sys; print(json.load(open(sys.argv[1]))['Version'])",
         _sdk_settings,
     ])
@@ -618,7 +628,11 @@ if __name__ == "__main__":
     _clang = xcode_toolchain_bindir + "clang"
     _ar = xcode_toolchain_bindir + "ar"
     _xcode_toolchain_libdir = xcode_toolchain_bindir + "../lib/swift/"
-    for _platform_info in [("iphoneos", "arm64-apple-ios13.0"), ("iphonesimulator", "arm64-apple-ios13.0-simulator"), ("macosx", "arm64-apple-macos11.0")]:
+
+    # Compiling the stubs requires executing the hermetic linux clang, which
+    # only works on a linux host.
+    _compat_platforms = [("iphoneos", "arm64-apple-ios13.0"), ("iphonesimulator", "arm64-apple-ios13.0-simulator"), ("macosx", "arm64-apple-macos11.0")] if _host_is_linux_x86_64(rctx) else []
+    for _platform_info in _compat_platforms:
         _platform_name = _platform_info[0]
         _target_triple = _platform_info[1]
         _swift_platform_lib = _xcode_toolchain_libdir + _platform_name
@@ -668,28 +682,63 @@ if __name__ == "__main__":
                         "sed 's/arm64e-apple-ios/arm64-apple-ios/g' '" + _arm64e + "' > '" + _arm64 + "'",
                     ])
 
-    _compile_cc_file(
-        rctx,
-        str(libtool_cc),
-        "libtool",
-        toolchain_bindir = xcode_toolchain_bindir,
-        std = "c++17",
-    )
+    if _host_is_linux_x86_64(rctx):
+        _compile_cc_file(
+            rctx,
+            str(libtool_cc),
+            "libtool",
+            toolchain_bindir = xcode_toolchain_bindir,
+            std = "c++17",
+        )
 
-    rctx.template("wrapped_clang.cc", wrapped_clang_src, {})
-    _compile_cc_file(
-        rctx,
-        str(rctx.path("wrapped_clang.cc")),
-        "wrapped_clang",
-        toolchain_bindir = xcode_toolchain_bindir,
-    )
-    rctx.delete("wrapped_clang.cc")
+        rctx.template("wrapped_clang.cc", wrapped_clang_src, {})
+        _compile_cc_file(
+            rctx,
+            str(rctx.path("wrapped_clang.cc")),
+            "wrapped_clang",
+            toolchain_bindir = xcode_toolchain_bindir,
+        )
+        rctx.delete("wrapped_clang.cc")
+    else:
+        # Non-linux host (e.g. macOS driving remote execution): the hermetic
+        # linux clang cannot run here, so use prebuilt helper binaries behind
+        # dispatch scripts. Bazel's cpp_link exec group can land archive/link
+        # actions on a macOS executor even when the toolchain is linux-exec;
+        # archiving is platform-independent, so fall back to the host libtool
+        # there. Compile/link must stay on linux.
+        for tool in ("wrapped_clang", "libtool"):
+            prebuilt = rctx.path(Label("@rules_applecross//toolchain/prebuilt/linux-x86_64:" + tool))
+            rctx.execute(["cp", str(prebuilt), tool + "-linux-x86_64"])
+            rctx.execute(["chmod", "755", tool + "-linux-x86_64"])
+        rctx.file("libtool", content = """\
+#!/bin/bash
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # The action env carries this toolchain's execroot-relative DEVELOPER_DIR;
+  # the host xcrun needs the real Xcode.
+  unset DEVELOPER_DIR SDKROOT
+  exec /usr/bin/xcrun libtool "$@"
+fi
+exec "$(dirname "$0")/libtool-linux-x86_64" "$@"
+""", executable = True)
+        rctx.file("wrapped_clang", content = """\
+#!/bin/bash
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  echo "rules_applecross wrapped_clang: this toolchain's compile/link actions must execute on a linux worker, but this action ran on macOS" >&2
+  exit 1
+fi
+# argv[0] selects C vs C++ mode (wrapped_clang / wrapped_clang_pp);
+# preserve the name this dispatch script was invoked as.
+exec -a "$0" "$(dirname "$0")/wrapped_clang-linux-x86_64" "$@"
+""", executable = True)
     rctx.symlink("wrapped_clang", "wrapped_clang_pp")
 
     # Generate Swift version file for the Linux swift_toolchain rule.
-    swiftc = xcode_toolchain_bindir + "swiftc"
-    result = rctx.execute([swiftc, "--version"])
-    rctx.file("swift_version", result.stdout if result.return_code == 0 else "")
+    if _host_is_linux_x86_64(rctx):
+        swiftc = xcode_toolchain_bindir + "swiftc"
+        result = rctx.execute([swiftc, "--version"])
+        rctx.file("swift_version", result.stdout if result.return_code == 0 else "")
+    else:
+        rctx.file("swift_version", rctx.attr.swift_version_string)
 
 _DEFAULT_SWIFT_URLS = ["https://github.com/apple-cross-toolchain/ci/releases/download/0.0.20/swift-6.2.3-RELEASE-ubuntu24.04-stripped.tar.xz"]
 _DEFAULT_SWIFT_SHA256 = "b84d5a7ced3ce25a8b1f94be448f1927e159712e7e2c95b7047afeb0f5c266f5"
@@ -722,6 +771,10 @@ apple_cross_toolchain = repository_rule(
         ),
         "swift_strip_prefix": attr.string(
             default = _DEFAULT_SWIFT_STRIP_PREFIX,
+        ),
+        "swift_version_string": attr.string(
+            doc = "swiftc --version output to record when the host cannot execute the linux swiftc.",
+            default = "Swift version 6.2.3 (swift-6.2.3-RELEASE)\nTarget: x86_64-unknown-linux-gnu\n",
         ),
     },
     environ = ["HOME", "PATH"],

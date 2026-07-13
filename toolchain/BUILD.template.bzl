@@ -30,6 +30,20 @@ exports_files([
     "xcrunwrapper.sh",
 ])
 
+# Prebuilt linux-x86_64 helper binaries, present only when the repository was
+# assembled on a non-linux host (where wrapped_clang/libtool can't be compiled
+# at fetch time); empty otherwise. See the toolchain repository rule.
+filegroup(
+    name = "prebuilt_linux_tools",
+    srcs = glob(
+        [
+            "wrapped_clang-linux-x86_64",
+            "libtool-linux-x86_64",
+        ],
+        allow_empty = True,
+    ),
+)
+
 # =============================================================================
 # File groups
 # =============================================================================
@@ -94,14 +108,20 @@ filegroup(
 cc_tool(
     name = "wrapped_clang_tool",
     src = ":wrapped_clang",
-    data = [":toolchain_files"],
+    data = [
+        ":prebuilt_linux_tools",
+        ":toolchain_files",
+    ],
     allowlist_include_directories = [],
 )
 
 cc_tool(
     name = "wrapped_clang_pp_tool",
     src = ":wrapped_clang_pp",
-    data = [":toolchain_files"],
+    data = [
+        ":prebuilt_linux_tools",
+        ":toolchain_files",
+    ],
     allowlist_include_directories = [],
 )
 
@@ -109,6 +129,7 @@ cc_tool(
     name = "cc_wrapper_tool",
     src = ":cc_wrapper.sh",
     data = [
+        ":prebuilt_linux_tools",
         ":toolchain_files",
         ":wrapped_clang",
         ":wrapped_clang_pp",
@@ -120,7 +141,10 @@ cc_tool(
 cc_tool(
     name = "libtool_tool",
     src = ":libtool",
-    data = [":toolchain_files"],
+    data = [
+        ":prebuilt_linux_tools",
+        ":toolchain_files",
+    ],
     allowlist_include_directories = [],
 )
 
